@@ -14664,7 +14664,7 @@ export function issueRoutes(
         const runToStopForReassignment = await resolveActiveIssueRun(existing);
         const isHumanSelfHandoff =
           req.actor.type === "agent" &&
-          req.actor.source === "agent_jwt" &&
+          (req.actor.source === "agent_jwt" || req.actor.source === "agent_key") &&
           nextAssigneeAgentId === null &&
           typeof nextAssigneeUserId === "string" &&
           req.actor.agentId === existing.assigneeAgentId &&
