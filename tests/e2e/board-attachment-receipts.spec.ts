@@ -480,6 +480,7 @@ for (const classic of [false, true]) {
       ]);
     } finally {
       release();
+      await page.unrouteAll({ behavior: "wait" });
     }
   });
 }
