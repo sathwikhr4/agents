@@ -31,6 +31,7 @@ import { readNativeMonitorSource } from "./native-runtime/native-monitor-deliver
 import { readNativeContinuationSource } from "./native-runtime/native-continuation-delivery.js";
 import { assertNoCaseHandoffMutation, cancelCaseHandoffsForIssue, completeTerminalCaseHandoffsForIssue } from "./heartbeat/case-handoff-lifecycle.js";
 import { measureRunPhase } from "./execution-preparation-timing.js";
+import { assertDeliveryAttestationSatisfied } from "./delivery-attestations.js";
 import { automaticReadRecoveryCleanupCondition, directHumanCommentCondition, humanCreatedIssueCondition, pendingUserRequestCondition, pendingUserRequestRowCondition, touchedByUserCondition, userParticipationActivityCondition } from "./issue-participation.js";
 import { resolveProjectDefaultWorkspaceId } from "./project-default-workspace.js";
 import { type AuthorizationActor, executionWorkspaceReadSqlCondition, projectReadSqlCondition } from "./authorization.js";
@@ -5077,6 +5078,8 @@ const issueListSelect = {
   requestDepth: issues.requestDepth,
   billingCode: issues.billingCode,
   assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
+  completionRequirement: issues.completionRequirement,
+  completionRequirementRevision: issues.completionRequirementRevision,
   executionPolicy: sql<null>`null`,
   executionState: sql<null>`null`,
   monitorNextCheckAt: issues.monitorNextCheckAt,
@@ -7405,6 +7408,7 @@ export function issueService(db: Db) {
         id: projectWorkspaces.id,
         companyId: projectWorkspaces.companyId,
         projectId: projectWorkspaces.projectId,
+        defaultCompletionRequirement: projectWorkspaces.defaultCompletionRequirement,
       })
       .from(projectWorkspaces)
       .where(eq(projectWorkspaces.id, projectWorkspaceId))
@@ -10514,13 +10518,23 @@ export function issueService(db: Db) {
           if (!readableWorkspace) throw notFound("Workspace is unavailable or inaccessible");
           await assertExecutionWorkspaceRecordAccess(tx, workspaceActor, companyId, readableWorkspace.id);
         }
+        let targetProjectWorkspace: Awaited<ReturnType<typeof assertValidProjectWorkspace>> | null = null;
         if (projectWorkspaceId) {
-          await assertValidProjectWorkspace(
+          targetProjectWorkspace = await assertValidProjectWorkspace(
             companyId,
             null,
             projectWorkspaceId,
             tx,
           );
+        }
+        const nextCompletionRequirement =
+          issueData.completionRequirement !== undefined
+            ? issueData.completionRequirement
+            : targetProjectWorkspace?.defaultCompletionRequirement ?? null;
+        if (issueData.status === "done" && nextCompletionRequirement === "workspace_delivery") {
+          throw unprocessable("Delivery attestation is required to complete this issue", {
+            code: "delivery_attestation_required",
+          });
         }
         if (
           isolatedWorkspacesEnabled &&
@@ -10654,6 +10668,7 @@ export function issueService(db: Db) {
           companyId,
           issueNumber,
           identifier,
+          completionRequirement: nextCompletionRequirement,
         } as typeof issues.$inferInsert;
         if (values.status === "in_progress" && !values.startedAt) {
           values.startedAt = new Date();
@@ -11508,6 +11523,25 @@ export function issueService(db: Db) {
         if (actorAgentId && patch.status === "done") {
           const [review] = await tx.select({ id: toolActionRequests.id }).from(toolActionRequests).where(and(eq(toolActionRequests.companyId, existing.companyId), eq(toolActionRequests.issueId, id), inArray(toolActionRequests.status, ["pending", "approved", "executing"]))).limit(1);
           if (review) throw conflict("This task is waiting for a connection review. Finish unrelated work, then yield in_review without retrying the governed call.", { code: "tool_review_pending", actionRequestId: review.id });
+        }
+        if (
+          issueData.completionRequirement !== undefined &&
+          issueData.completionRequirement !== receiptExisting.completionRequirement
+        ) {
+          patch.completionRequirementRevision = receiptExisting.completionRequirementRevision + 1;
+        }
+        if (patch.status === "done" && receiptExisting.status !== "done") {
+          const nextCompletionRequirement =
+            issueData.completionRequirement !== undefined ? issueData.completionRequirement : receiptExisting.completionRequirement;
+          const nextProjectWorkspaceId =
+            issueData.projectWorkspaceId !== undefined ? issueData.projectWorkspaceId : receiptExisting.projectWorkspaceId;
+          await assertDeliveryAttestationSatisfied(tx as Db, {
+            companyId: receiptExisting.companyId,
+            issueId: id,
+            projectWorkspaceId: nextProjectWorkspaceId,
+            completionRequirement: nextCompletionRequirement,
+            completionRequirementRevision: patch.completionRequirementRevision ?? receiptExisting.completionRequirementRevision,
+          });
         }
 
         const [previousLabelsByIssueId, previousRelationSummaries] = await Promise.all([
