@@ -1723,6 +1723,8 @@ export const PLUGIN_EVENT_TYPES = [
   "goal.created",
   "goal.updated",
   "approval.created",
+  "approval.approved",
+  "approval.rejected",
   "approval.decided",
   "budget.incident.opened",
   "budget.incident.resolved",
