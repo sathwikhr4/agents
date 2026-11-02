@@ -294,6 +294,9 @@ describeEmbeddedPostgres("merged Muse migration histories", () => {
       const beforeHistory = baseline === "fresh" ? [] : await historyRows(sql);
       const retainedRows = baseline === "fresh" ? null : await seedRetainedRows(sql, baseline === "muse0348");
       const beforeRows = await retainedRows?.();
+      if (beforeRows) {
+        beforeRows.task = { ...beforeRows.task, completion_requirement: null, completion_requirement_revision: 0 };
+      }
       const state = await inspectMigrations(connectionString);
       expect(state.status).toBe("needsMigrations");
       const laterMigrations = journal.entries.filter(entry => entry.idx > 353).map(entry => `${entry.tag}.sql`);
