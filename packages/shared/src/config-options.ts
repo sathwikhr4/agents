@@ -135,7 +135,6 @@ export const LOGGING_OPTIONS: readonly ConfigOptionDefinition[] = [
     key: "logging.mode",
     type: "'file' | 'cloud'",
     validValues: ["file", "cloud"],
-    default: "file",
     description: "Logging destination: file or cloud",
   },
   {
@@ -344,13 +343,20 @@ export const CONFIG_SECTIONS: readonly ConfigSectionDefinition[] = [
     description: "Automatic update checking",
     options: UPDATES_OPTIONS,
   },
+  {
+    section: "meta",
+    label: "Metadata",
+    description: "Configuration metadata, schema version, and update source",
+    options: META_OPTIONS,
+  },
 ];
 
 export const CONFIG_SECTION_NAMES: readonly string[] = CONFIG_SECTIONS.map((s) => s.section);
 
 export function getConfigSection(name: string): ConfigSectionDefinition | undefined {
   const normalized = name.toLowerCase().trim();
-  return CONFIG_SECTIONS.find((s) => s.section === normalized);
+  const stripped = normalized.startsWith("$") ? normalized.slice(1) : normalized;
+  return CONFIG_SECTIONS.find((s) => s.section === normalized || s.section === stripped);
 }
 
 export function formatOptionLine(opt: ConfigOptionDefinition): string {
@@ -358,7 +364,6 @@ export function formatOptionLine(opt: ConfigOptionDefinition): string {
   const optionalPart = opt.optional ? " (optional)" : "";
   return `${opt.key}: ${opt.type}${defaultPart}${optionalPart}\n  ${opt.description}`;
 }
-
 export function formatSectionOptions(section: ConfigSectionDefinition): string {
   const lines: string[] = [
     `Section: ${section.section} (${section.label})`,
