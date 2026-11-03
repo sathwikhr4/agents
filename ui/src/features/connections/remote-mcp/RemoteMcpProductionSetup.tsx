@@ -13,7 +13,7 @@ import { useCompany } from "@/context/CompanyContext";
 import { findAggregatorApp } from "@paperclipai/shared/aggregator-app-catalog";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { resolveAuthorizationTarget } from "@/lib/authorizationUrl";
-import { navigateTopLevel } from "@/lib/browserNavigation";
+import { readOAuthWindowOutcome } from "@/lib/oauthWindowOutcome";
 import { queryKeys } from "@/lib/queryKeys";
 import { RemoteMcpConnectionSetup } from "./RemoteMcpConnectionSetup";
 import { remoteMcpProviders, type RemoteMcpProviderId } from "./providers";
@@ -87,7 +87,7 @@ export function RemoteMcpProductionSetup({ providerId, connection, host = "page"
     try { sessionStorage.setItem(accessDraftKey, JSON.stringify({ grantKind: state.grantKind, allAgents: state.allAgents, agentIds: state.agentIds })); } catch { /* Storage can be disabled. */ }
   }, [connection, accessDraftKey, state.grantKind, state.allAgents, state.agentIds]);
   useEffect(() => {
-    if (host !== "dialog" || !interactionId) return;
+    if (!interactionId) return;
     const receive = (event: MessageEvent) => {
       const outcome = readConnectionIntentOAuthOutcome(event, window.location.origin, interactionId);
       if (!outcome) return;
@@ -125,6 +125,40 @@ export function RemoteMcpProductionSetup({ providerId, connection, host = "page"
     } else if (isAppAggregator(providerId)) navigate("/apps");
     else navigate(`/apps/${id}/permissions`);
   };
+  useEffect(() => {
+    if (state.connectStatus !== "sign_in" || !savedConnection.current) return;
+    const id = savedConnection.current.id;
+    let cancelled = false;
+    let checking = false;
+    const check = async () => {
+      if (checking || cancelled) return;
+      // Reconnect can begin with an already-active row. Wait for this attempt’s callback.
+      const outcome = readOAuthWindowOutcome(popup.current, id);
+      if (outcome === "waiting") return;
+      if (outcome !== "connected") {
+        popup.current?.close();
+        popup.current = null;
+        setState((s) => ({ ...s, connectStatus: outcome === "failed" ? "oauth_failed" : "cancelled" }));
+        onPhaseChange?.("needs_retry");
+        return;
+      }
+      if (interactionId) return; // The intent callback and host own durable acceptance.
+      checking = true;
+      try {
+        const saved = await toolsApi.getConnection(id);
+        if (!cancelled && saved.status === "active") {
+          cancelled = true;
+          popup.current?.close();
+          popup.current = null;
+          await finish(id);
+        }
+      } catch { /* Keep the saved sign-in and allow a later focus or poll to retry. */ }
+      finally { checking = false; }
+    };
+    const timer = window.setInterval(() => void check(), 2000);
+    window.addEventListener("focus", check);
+    return () => { cancelled = true; window.clearInterval(timer); window.removeEventListener("focus", check); };
+  }, [state.connectStatus, interactionId]);
   const submit = async (saveDraft = false) => {
     if (busy.current || !selectedCompanyId || !instructionsValid || (connection && !installs.data)) return;
     try {
@@ -133,9 +167,9 @@ export function RemoteMcpProductionSetup({ providerId, connection, host = "page"
     } catch { edit({ connectStatus: "invalid_url" }); return; }
     // Reserve the window while handling the click so popup blockers do not
     // discard the later OAuth response. URL/token-only providers never need it.
-    if (!saveDraft && host === "dialog" && state.auth === "auto" && (!popup.current || popup.current.closed)) {
+    if (!saveDraft && state.auth === "auto" && (!popup.current || popup.current.closed)) {
       try {
-        popup.current = window.open("about:blank", "paperclip-connection-oauth", "popup,width=720,height=760,resizable=yes,scrollbars=yes");
+        popup.current = window.open("about:blank", "_blank", "popup,width=720,height=760,resizable=yes,scrollbars=yes");
       } catch { popup.current = null; }
     }
     busy.current = true;
@@ -187,11 +221,9 @@ export function RemoteMcpProductionSetup({ providerId, connection, host = "page"
         authorizationUrl.current = target.url;
         edit({ connectStatus: "sign_in", token: "", headers: [] });
         try {
-          if (host === "dialog") {
-            if (!popup.current || popup.current.closed) throw new Error("Sign-in window unavailable");
-            popup.current.location.assign(target.url);
-            popup.current.focus();
-          } else navigateTopLevel(target.url);
+          if (!popup.current || popup.current.closed) throw new Error("Sign-in window unavailable");
+          popup.current.location.assign(target.url);
+          popup.current.focus();
         } catch {
           // The connection and OAuth session already exist. Preserve them and
           // let the native sign-in link recover a blocked browser handoff.
