@@ -68,7 +68,7 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.0",
-    "@storybook/addon-a11y": "10.4.2",
+    "@storybook/addon-a11y": "10.6.5",
     "@storybook/addon-docs": "10.3.5",
     "@storybook/react-vite": "10.4.6",
     "@types/node": "^22.19.21",
