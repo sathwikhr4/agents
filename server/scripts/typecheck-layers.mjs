@@ -11,6 +11,7 @@
 //   cycle  the largest import cycle, reading `below` as declarations
 //   above  files that depend on the cycle, reading both as declarations
 //   tests  test files, reading all three as declarations
+//   test-tree-N  src/__tests__, in shards, reading the source layers as declarations
 //
 // The layers come from the import graph on every run, so nothing has to move
 // and no list can go stale. The import scan does not have to be perfect: if it
@@ -20,19 +21,34 @@
 // server/tsconfig.json stays the single program that editors and `pnpm build`
 // use.
 //
-// Usage: node scripts/typecheck-layers.mjs
+// src/__tests__ has a backlog of type errors, so the test-tree layers compare a
+// count per file with scripts/typecheck-test-tree-baseline.json instead of
+// failing on any error. A count above the baseline fails, so no new error gets
+// in. A count below the baseline also fails, so that a fixed error cannot come
+// back. The plan to remove the backlog is in
+// doc/plans/2026-11-02-server-test-tree-typecheck.md.
+//
+// Usage: node scripts/typecheck-layers.mjs [--update-test-baseline]
+//
+// --update-test-baseline lowers the baseline to the current counts. It never
+// raises a count or adds a file, so a raise is a visible edit by hand.
 
-import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { crc32 } from "node:zlib";
 import { runTsc } from "../../scripts/run-tsc.mjs";
 
 const IMPORT_SPECIFIER = /(?:from\s+|import\s*\(\s*|import\s+)["'](\.[^"']+)["']/g;
 const OUTPUT_DIRECTORY = path.join("node_modules", ".cache", "paperclip-typecheck");
+const BASELINE_FILE = path.join("scripts", "typecheck-test-tree-baseline.json");
+// One program over this tree peaks at 3.9 GiB on one thread. Three peak at 2.6 GiB.
+const TEST_TREE_SHARDS = 3;
+const DIAGNOSTIC = /^(?:(.+?)\((\d+),(\d+)\): )?error (TS\d+): /;
 
 const isTestFile = (file) => /\.test\.tsx?$/.test(file) || file.split("/").includes("__tests__");
-// tsconfig.json excludes this tree. A test reaches its helpers through imports.
-const isExcludedFromProgram = (file) => file.startsWith("src/__tests__/");
+// tsconfig.json excludes this tree, so the test-tree layers check it.
+const isTestTreeFile = (file) => file.startsWith("src/__tests__/");
 
 export function listSourceFiles(serverRoot) {
   const files = [];
@@ -170,7 +186,12 @@ export function planLayers(files) {
   const dependents = reachableFrom(cycle, reversed);
   const above = [...dependents].filter((file) => !cycle.has(file));
   const below = [...graph.keys()].filter((file) => !dependents.has(file));
-  const tests = [...candidates.keys()].filter((file) => isTestFile(file) && !isExcludedFromProgram(file));
+  const tests = [...candidates.keys()].filter((file) => isTestFile(file) && !isTestTreeFile(file));
+  // A hash keeps each file in its shard when other files are added or removed.
+  const testTree = Array.from({ length: TEST_TREE_SHARDS }, () => []);
+  for (const file of candidates.keys()) {
+    if (isTestTreeFile(file)) testTree[crc32(file) % TEST_TREE_SHARDS].push(file);
+  }
 
   const layer = (name, members, references) => {
     const sorted = [...members].sort();
@@ -182,6 +203,10 @@ export function planLayers(files) {
     layer("cycle", cycle, ["below"]),
     layer("above", above, ["below", "cycle"]),
     layer("tests", tests, ["below", "cycle", "above"]),
+    ...testTree.map((shard, index) => ({
+      ...layer(`test-tree-${index}`, shard, ["below", "cycle", "above"]),
+      ratcheted: true,
+    })),
   ].filter((candidate) => candidate.sourceFiles.length > 0);
 }
 
@@ -191,6 +216,15 @@ export function layerConfig(layer, { emptyLayers = new Set() } = {}) {
   const references = layer.references
     .filter((name) => !emptyLayers.has(name))
     .map((name) => ({ path: `./tsconfig.${name}.json` }));
+  // Editors read the same options from this file.
+  if (layer.ratcheted) {
+    return {
+      extends: fromOutput("src/__tests__/tsconfig.json"),
+      files: layer.files.map(fromOutput),
+      include: [],
+      references,
+    };
+  }
   const output =
     layer.name === "tests"
       ? { composite: false, declaration: false, declarationMap: false, sourceMap: false, noEmit: true }
@@ -212,10 +246,101 @@ export function layerConfig(layer, { emptyLayers = new Set() } = {}) {
   };
 }
 
+/** Reads `tsc --pretty false` output. A line that follows a diagnostic belongs to it. */
+export function parseDiagnostics(output) {
+  const diagnostics = [];
+  for (const line of output.split(/\r?\n/)) {
+    const match = DIAGNOSTIC.exec(line);
+    if (match) {
+      const [, file = null, row, column, code] = match;
+      diagnostics.push({ file, key: `${file}(${row},${column}): ${code}`, text: line });
+    } else if (line && diagnostics.length > 0) {
+      diagnostics[diagnostics.length - 1].text += `\n${line}`;
+    }
+  }
+  return diagnostics;
+}
+
+/**
+ * Sorts diagnostics from all shards by what the baseline does with them. Shards
+ * can read the same file, so this removes duplicates. Files in other packages
+ * are out of scope: a test can import one, and its own project checks it. A
+ * diagnostic with no file, or in a config, is a failure that no baseline covers.
+ */
+export function classifyDiagnostics(diagnostics) {
+  const unique = [...new Map(diagnostics.map((diagnostic) => [diagnostic.key, diagnostic])).values()];
+  const isOtherPackage = ({ file }) => file?.startsWith("../") && !file.endsWith(".json");
+  const isCounted = ({ file }) => file?.startsWith("src/") && !file.endsWith(".json");
+  return {
+    counted: unique.filter(isCounted),
+    otherPackages: unique.filter(isOtherPackage),
+    fatal: unique.filter((diagnostic) => !isCounted(diagnostic) && !isOtherPackage(diagnostic)),
+  };
+}
+
+export function compareToBaseline(counts, baseline) {
+  const increased = [];
+  const decreased = [];
+  for (const file of [...new Set([...Object.keys(counts), ...Object.keys(baseline)])].sort()) {
+    const entry = { file, count: counts[file] ?? 0, baseline: baseline[file] ?? 0 };
+    if (entry.count > entry.baseline) increased.push(entry);
+    if (entry.count < entry.baseline) decreased.push(entry);
+  }
+  return { increased, decreased };
+}
+
+/** Lowers counts and removes fixed files. It never raises a count or adds a file. */
+export function lowerBaseline(counts, baseline) {
+  const lowered = {};
+  for (const file of Object.keys(baseline).sort()) {
+    const count = Math.min(baseline[file], counts[file] ?? 0);
+    if (count > 0) lowered[file] = count;
+  }
+  return lowered;
+}
+
+function checkTestTree({ serverRoot, results, updateBaseline, log, logError }) {
+  const diagnostics = results.flatMap(({ stdout }) => parseDiagnostics(stdout));
+  const unexplained = results.filter(({ status, stdout }) => status !== 0 && parseDiagnostics(stdout).length === 0);
+  for (const { stdout } of unexplained) logError(stdout || "tsc failed with no diagnostics.");
+  const { counted, otherPackages, fatal } = classifyDiagnostics(diagnostics);
+  for (const { text } of fatal) logError(text);
+  if (unexplained.length > 0 || fatal.length > 0) return 1;
+
+  const counts = {};
+  for (const { file } of counted) counts[file] = (counts[file] ?? 0) + 1;
+  const baselinePath = path.join(serverRoot, BASELINE_FILE);
+  let baseline = existsSync(baselinePath) ? JSON.parse(readFileSync(baselinePath, "utf8")) : {};
+  if (updateBaseline) {
+    baseline = lowerBaseline(counts, baseline);
+    mkdirSync(path.dirname(baselinePath), { recursive: true });
+    writeFileSync(baselinePath, `${JSON.stringify(baseline, null, 2)}\n`);
+  }
+
+  const { increased, decreased } = compareToBaseline(counts, baseline);
+  for (const { file, count, baseline: allowed } of increased) {
+    logError(`typecheck:layers: ${file}: ${count} type errors, baseline ${allowed}. Fix the new errors.`);
+    for (const diagnostic of counted) if (diagnostic.file === file) logError(diagnostic.text);
+  }
+  for (const { file, count, baseline: allowed } of decreased) {
+    logError(`typecheck:layers: ${file}: ${count} type errors, baseline ${allowed}. The count went down.`);
+  }
+  if (decreased.length > 0) {
+    logError("typecheck:layers: Lower the baseline: pnpm --filter @paperclipai/server typecheck --update-test-baseline");
+  }
+  log(
+    `typecheck:layers: test tree has ${counted.length} type errors in ${Object.keys(counts).length} files` +
+      ` (${otherPackages.length} more in other packages are out of scope)`,
+  );
+  return increased.length > 0 || decreased.length > 0 ? 1 : 0;
+}
+
 export function typecheckLayers({
   serverRoot,
   run = runTsc,
   log = console.log,
+  logError = console.error,
+  updateBaseline = false,
 }) {
   const sourceFiles = listSourceFiles(serverRoot);
   const layers = planLayers(
@@ -237,15 +362,25 @@ export function typecheckLayers({
   }
 
   let exitCode = 0;
+  const testTreeResults = [];
   for (const layer of layers) {
     log(`typecheck:layers: ${layer.name} (${layer.sourceFiles.length} files)`);
     const config = path.join(OUTPUT_DIRECTORY, `tsconfig.${layer.name}.json`);
-    const { status, signal } = run(["-p", config], { cwd: serverRoot });
+    const args = layer.ratcheted ? ["-p", config, "--pretty", "false"] : ["-p", config];
+    const { status, signal, stdout = "" } = run(args, { cwd: serverRoot, capture: Boolean(layer.ratcheted) });
     // A killed process leaves no declarations, so later layers would only add noise.
     if (signal) return status || 1;
+    if (layer.ratcheted) {
+      testTreeResults.push({ status, stdout });
+      continue;
+    }
     // Later layers still run after type errors. Each file is checked in one
     // layer, so this reports everything a single tsc run would.
     if (status !== 0) exitCode = status;
+  }
+  if (testTreeResults.length > 0) {
+    const status = checkTestTree({ serverRoot, results: testTreeResults, updateBaseline, log, logError });
+    if (status !== 0 && exitCode === 0) exitCode = status;
   }
   return exitCode;
 }
@@ -253,5 +388,6 @@ export function typecheckLayers({
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   process.exitCode = typecheckLayers({
     serverRoot: path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."),
+    updateBaseline: process.argv.includes("--update-test-baseline"),
   });
 }

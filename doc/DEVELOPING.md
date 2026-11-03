@@ -1147,7 +1147,8 @@ process per layer. Each layer reads the earlier layers as declarations:
 | `below` | Files the largest import cycle depends on, and unrelated files |
 | `cycle` | The largest import cycle |
 | `above` | Files that depend on the cycle |
-| `tests` | Test files |
+| `tests` | Test files outside `src/__tests__` |
+| `test-tree-0` to `test-tree-2` | `src/__tests__`, in shards |
 
 The generated configs and declarations go in
 `server/node_modules/.cache/paperclip-typecheck`. You do not maintain a layer list.
@@ -1155,6 +1156,25 @@ The generated configs and declarations go in
 The server typecheck builds only the Runner's TypeScript output. Use
 `pnpm --filter @paperclipai/paperclip-runner build` when a local check needs the
 Runner binary.
+
+`src/__tests__` has a backlog of type errors, so the test-tree layers do not fail on
+any error. They compare the error count of each file with
+`server/scripts/typecheck-test-tree-baseline.json`:
+
+- A count above the baseline fails. Fix the new errors. Do not raise the baseline
+  unless you have a reason that you can state in the pull request.
+- A count below the baseline fails, so a fixed error cannot come back. Lower the
+  baseline with the command below. It never raises a count or adds a file.
+
+```sh
+pnpm --filter @paperclipai/server typecheck --update-test-baseline
+```
+
+Errors in other packages that a test imports do not count, because their own
+projects check them. `src/__tests__/tsconfig.json` holds the options, so an editor
+and the typecheck report the same errors. See
+`doc/plans/2026-11-02-server-test-tree-typecheck.md` for the plan to remove the
+backlog.
 
 If the memory available to the task is limited, use this command:
 

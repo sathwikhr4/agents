@@ -8,7 +8,17 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { emitOnlyTscArgs, lowMemoryTscArgs, runTsc } from "../../scripts/run-tsc.mjs";
 import { STEPS, typecheckLowMemory } from "../../scripts/typecheck-low-memory.mjs";
-import { layerConfig, listSourceFiles, planLayers, readImports, typecheckLayers } from "./typecheck-layers.mjs";
+import {
+  classifyDiagnostics,
+  compareToBaseline,
+  layerConfig,
+  listSourceFiles,
+  lowerBaseline,
+  parseDiagnostics,
+  planLayers,
+  readImports,
+  typecheckLayers,
+} from "./typecheck-layers.mjs";
 
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sourcesOf = (layers, name) => layers.find((layer) => layer.name === name)?.sourceFiles;
@@ -75,7 +85,7 @@ describe("planLayers", () => {
     for (const layer of layers) expect(layer.files).toContain("src/types/ambient.d.ts");
   });
 
-  it("keeps test support files in the test layer and leaves src/__tests__ to imports", () => {
+  it("keeps test support files in the test layer and shards src/__tests__ by a stable hash", () => {
     const layers = planLayers(
       new Map([
         ["src/a.ts", ""],
@@ -87,6 +97,25 @@ describe("planLayers", () => {
 
     expect(sourcesOf(layers, "below")).toEqual(["src/a.ts"]);
     expect(sourcesOf(layers, "tests")).toEqual(["src/services/__tests__/fixtures.ts"]);
+    const shards = layers.filter((layer) => layer.ratcheted);
+    expect(shards.flatMap((layer) => layer.sourceFiles).sort()).toEqual([
+      "src/__tests__/big.test.ts",
+      "src/__tests__/helpers/db.ts",
+    ]);
+    for (const shard of shards) expect(shard.references).toEqual(["below", "cycle", "above"]);
+
+    const withMore = planLayers(
+      new Map([
+        ["src/a.ts", ""],
+        ["src/__tests__/helpers/db.ts", ""],
+        ["src/__tests__/big.test.ts", ""],
+        ["src/__tests__/added-1.test.ts", ""],
+        ["src/__tests__/added-2.test.ts", ""],
+      ]),
+    );
+    for (const shard of shards) {
+      for (const file of shard.sourceFiles) expect(sourcesOf(withMore, shard.name)).toContain(file);
+    }
   });
 
   it("lists imported JSON in the layer that imports it", () => {
@@ -119,14 +148,14 @@ describe("planLayers", () => {
     const planned = layers.flatMap((layer) => layer.sourceFiles);
     expect(new Set(planned).size).toBe(planned.length);
     expect(planned.sort()).toEqual(
-      sourceFiles.filter((file) => !file.endsWith(".d.ts") && !file.startsWith("src/__tests__/")).sort(),
+      sourceFiles.filter((file) => !file.endsWith(".d.ts")).sort(),
     );
 
     const position = new Map(
       layers.flatMap((layer, index) => layer.sourceFiles.map((file) => [file, index])),
     );
     const imports = readImports(new Map([...files].filter(([file]) => !file.endsWith(".d.ts"))));
-    for (const layer of layers.filter((candidate) => candidate.name !== "tests")) {
+    for (const layer of layers.filter((candidate) => candidate.name !== "tests" && !candidate.ratcheted)) {
       for (const file of layer.sourceFiles) {
         for (const target of imports.get(file).modules) {
           if (position.has(target)) expect(position.get(target)).toBeLessThanOrEqual(position.get(file));
@@ -156,6 +185,108 @@ describe("layerConfig", () => {
 
     expect(config.compilerOptions).toMatchObject({ composite: false, noEmit: true });
     expect(config.references).toEqual([{ path: "./tsconfig.below.json" }]);
+  });
+});
+
+describe("layerConfig for the test tree", () => {
+  it("reads the options that editors read and emits nothing", () => {
+    const config = layerConfig({
+      name: "test-tree-0",
+      files: ["src/__tests__/a.test.ts"],
+      references: ["below"],
+      ratcheted: true,
+    });
+
+    expect(config.extends).toBe("../../../src/__tests__/tsconfig.json");
+    expect(config.compilerOptions).toBeUndefined();
+    expect(config.files).toEqual(["../../../src/__tests__/a.test.ts"]);
+    expect(config.references).toEqual([{ path: "./tsconfig.below.json" }]);
+  });
+
+  it("has a real tests tsconfig that cannot emit and sees the ambient types", () => {
+    const config = JSON.parse(readFileSync(path.join(serverRoot, "src/__tests__/tsconfig.json"), "utf8"));
+
+    expect(config.compilerOptions).toMatchObject({ noEmit: true, rootDir: "../../.." });
+    expect(config.include).toContain("../types/*.d.ts");
+  });
+});
+
+describe("the test tree baseline", () => {
+  it("reads every diagnostic form and keeps follow-up lines", () => {
+    const diagnostics = parseDiagnostics(
+      [
+        "src/__tests__/a.test.ts(1,2): error TS2322: Type 'string' is not assignable.",
+        "  Types are different.",
+        "error TS5083: Cannot read file.",
+        "",
+      ].join("\n"),
+    );
+
+    expect(diagnostics).toHaveLength(2);
+    expect(diagnostics[0]).toMatchObject({ file: "src/__tests__/a.test.ts", key: "src/__tests__/a.test.ts(1,2): TS2322" });
+    expect(diagnostics[0].text).toContain("Types are different.");
+    expect(diagnostics[1].file).toBeNull();
+  });
+
+  it("counts one error once when shards share a file, and separates other packages and config failures", () => {
+    const shared = "src/__tests__/helpers/db.ts(1,1): error TS2322: Wrong.\n";
+    const { counted, otherPackages, fatal } = classifyDiagnostics(
+      parseDiagnostics(
+        [
+          shared,
+          shared,
+          "src/__tests__/helpers/db.ts(2,1): error TS2322: Wrong.\n",
+          "../packages/x/src/y.ts(1,1): error TS2307: Cannot find module.\n",
+          "error TS5083: Cannot read file.\n",
+          "node_modules/.cache/paperclip-typecheck/tsconfig.test-tree-0.json(3,3): error TS5095: Bad option.\n",
+          "src/__tests__/tsconfig.json(3,3): error TS5095: Bad option.\n",
+          "../tsconfig.base.json(3,3): error TS5095: Bad option.\n",
+        ].join(""),
+      ),
+    );
+
+    expect(counted.map(({ key }) => key)).toEqual([
+      "src/__tests__/helpers/db.ts(1,1): TS2322",
+      "src/__tests__/helpers/db.ts(2,1): TS2322",
+    ]);
+    expect(otherPackages.map(({ file }) => file)).toEqual(["../packages/x/src/y.ts"]);
+    expect(fatal).toHaveLength(4);
+  });
+
+  it("reports counts above and below the baseline, including a new file and a removed file", () => {
+    const { increased, decreased } = compareToBaseline(
+      { "new.ts": 1, "up.ts": 3, "same.ts": 2, "down.ts": 1 },
+      { "up.ts": 2, "same.ts": 2, "down.ts": 4, "removed.ts": 5 },
+    );
+
+    expect(increased).toEqual([
+      { file: "new.ts", count: 1, baseline: 0 },
+      { file: "up.ts", count: 3, baseline: 2 },
+    ]);
+    expect(decreased).toEqual([
+      { file: "down.ts", count: 1, baseline: 4 },
+      { file: "removed.ts", count: 0, baseline: 5 },
+    ]);
+  });
+
+  it("only lowers the baseline: it never raises a count or adds a file", () => {
+    expect(
+      lowerBaseline(
+        { "new.ts": 1, "up.ts": 3, "down.ts": 1 },
+        { "up.ts": 2, "down.ts": 4, "removed.ts": 5 },
+      ),
+    ).toEqual({ "down.ts": 1, "up.ts": 2 });
+  });
+
+  it("is sorted and lists only files in the test tree that exist", () => {
+    const text = readFileSync(path.join(serverRoot, "scripts/typecheck-test-tree-baseline.json"), "utf8");
+    const files = Object.keys(JSON.parse(text));
+
+    expect(files).toEqual([...files].sort());
+    for (const file of files) {
+      expect(file.startsWith("src/")).toBe(true);
+      expect(existsSync(path.join(serverRoot, file))).toBe(true);
+    }
   });
 });
 
@@ -317,6 +448,108 @@ describe("typecheckLayers with the real compiler", () => {
     expect(output).toContain("leaf");
   }, 60_000);
 
+  function addTestTree(root, source, baseline) {
+    mkdirSync(path.join(root, "src", "__tests__"), { recursive: true });
+    mkdirSync(path.join(root, "scripts"), { recursive: true });
+    writeFileSync(
+      path.join(root, "src", "__tests__", "tsconfig.json"),
+      `${JSON.stringify({
+        extends: "../../tsconfig.json",
+        compilerOptions: { noEmit: true, rootDir: "../.." },
+        include: ["."],
+      })}\n`,
+    );
+    writeFileSync(path.join(root, "src", "__tests__", "tree.test.ts"), source);
+    writeBaseline(root, baseline);
+  }
+
+  const writeBaseline = (root, baseline) =>
+    writeFileSync(path.join(root, "scripts", "typecheck-test-tree-baseline.json"), `${JSON.stringify(baseline)}\n`);
+  const readBaseline = (root) =>
+    JSON.parse(readFileSync(path.join(root, "scripts", "typecheck-test-tree-baseline.json"), "utf8"));
+
+  function checkTree(root, options = {}) {
+    const errors = [];
+    const status = typecheckLayers({
+      serverRoot: root,
+      log: () => {},
+      logError: (line) => errors.push(line),
+      run: (args, { cwd, capture }) => {
+        const result = spawnSync(process.execPath, [tsc, ...args], { cwd, encoding: "utf8" });
+        if (!capture) expect(result.stdout).toBe("");
+        return { status: result.status ?? 1, signal: result.signal, stdout: result.stdout };
+      },
+      ...options,
+    });
+    return { status, errors: errors.join("\n") };
+  }
+
+  const twoErrors = `import { route } from "../route.js";\nexport const a: string = route();\nexport const b: string = route();\n`;
+  const treePath = "src/__tests__/tree.test.ts";
+
+  it("passes the test tree at the baseline, through declarations", () => {
+    const root = compilerFixture();
+    addTestTree(root, twoErrors, { [treePath]: 2 });
+
+    const { status, errors } = checkTree(root);
+
+    expect(errors).toBe("");
+    expect(status).toBe(0);
+  }, 60_000);
+
+  it("fails and prints the errors when the test tree goes above the baseline", () => {
+    const root = compilerFixture();
+    addTestTree(root, twoErrors, { [treePath]: 1 });
+
+    const { status, errors } = checkTree(root);
+
+    expect(status).toBe(1);
+    expect(errors).toContain(`${treePath}: 2 type errors, baseline 1.`);
+    expect(errors).toMatch(/tree\.test\.ts\(2,\d+\): error TS2322/);
+  }, 60_000);
+
+  it("fails when a type error is in a test-tree file that the baseline does not list", () => {
+    const root = compilerFixture();
+    addTestTree(root, twoErrors, {});
+
+    const { status, errors } = checkTree(root);
+
+    expect(status).toBe(1);
+    expect(errors).toContain(": 2 type errors, baseline 0.");
+  }, 60_000);
+
+  it("fails below the baseline until the update lowers it, and the update never raises a count", () => {
+    const root = compilerFixture();
+    addTestTree(root, twoErrors, { [treePath]: 3, "src/__tests__/removed.test.ts": 4 });
+
+    const stale = checkTree(root);
+    expect(stale.status).toBe(1);
+    expect(stale.errors).toContain("--update-test-baseline");
+
+    const updated = checkTree(root, { updateBaseline: true });
+    expect(updated.status).toBe(0);
+    expect(readBaseline(root)).toEqual({ [treePath]: 2 });
+
+    writeBaseline(root, { [treePath]: 1 });
+    const raised = checkTree(root, { updateBaseline: true });
+    expect(raised.status).toBe(1);
+    expect(readBaseline(root)).toEqual({ [treePath]: 1 });
+  }, 120_000);
+
+  it("fails when the test-tree tsconfig is invalid, whatever the baseline says", () => {
+    const root = compilerFixture();
+    addTestTree(root, twoErrors, { [treePath]: 2 });
+    writeFileSync(
+      path.join(root, "src", "__tests__", "tsconfig.json"),
+      `${JSON.stringify({ extends: "../../tsconfig.json", compilerOptions: { noEmit: true, rootDir: "../..", target: "not-a-target" } })}\n`,
+    );
+
+    const { status, errors } = checkTree(root);
+
+    expect(status).not.toBe(0);
+    expect(errors).toMatch(/error TS\d+/);
+  }, 60_000);
+
   it("reports a type change through declarations in the test layer", () => {
     const root = compilerFixture();
     writeFileSync(
@@ -388,6 +621,13 @@ describe("runTsc", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 60_000);
+
+  it("returns stdout when the caller captures it", () => {
+    const { status, stdout } = runTsc(["--version"], { cwd: serverRoot, capture: true });
+
+    expect(status).toBe(0);
+    expect(stdout).toMatch(/^Version \d+/);
+  });
 
   it("accepts build mode with low-memory mode on", () => {
     const { status } = runTsc(["-b", "--dry"], {

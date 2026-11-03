@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 
 export const LOW_MEMORY_VARIABLE = "PAPERCLIP_TYPECHECK_LOW_MEMORY";
 export const EMIT_ONLY_VARIABLE = "PAPERCLIP_TSC_EMIT_ONLY";
+const CAPTURE_LIMIT_BYTES = 256 * 1024 * 1024;
 
 export function lowMemoryTscArgs(env = process.env) {
   return env[LOW_MEMORY_VARIABLE] === "1" ? ["--singleThreaded"] : [];
@@ -30,16 +31,18 @@ export function emitOnlyTscArgs(env = process.env) {
     : [];
 }
 
-export function runTsc(args, { cwd = process.cwd(), env = process.env } = {}) {
+export function runTsc(args, { cwd = process.cwd(), env = process.env, capture = false } = {}) {
   const tsc = path.join(cwd, "node_modules", "typescript", "bin", "tsc");
   // tsc only accepts -b as its first argument, so the caller's arguments go first.
   const result = spawnSync(process.execPath, [tsc, ...args, ...lowMemoryTscArgs(env), ...emitOnlyTscArgs(env)], {
     cwd,
     env,
-    stdio: "inherit",
+    stdio: capture ? ["inherit", "pipe", "inherit"] : "inherit",
+    encoding: "utf8",
+    maxBuffer: CAPTURE_LIMIT_BYTES,
   });
   if (result.error) throw result.error;
-  return { status: result.status ?? 1, signal: result.signal };
+  return { status: result.status ?? 1, signal: result.signal, stdout: result.stdout ?? "" };
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
