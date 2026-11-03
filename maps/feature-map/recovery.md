@@ -38,6 +38,9 @@ Agent access: [companion](../agent-access-map/recovery.md).
   Hosted provider settlement remains separate acceptance.
 - `source-action`: `recovery/source-action` — source-scoped recovery actions remain attached to the task;
   independent repair work may have its own issue and return owner.
+  Repeated scans retain the same settled legacy no-replay hold. One verified
+  reconciliation can resolve historical duplicates of that exact source with
+  one continuation owner. Separate workspace and system recovery stay held.
 - `exhaustion`: `recovery/exhaustion` — an exhausted infrastructure attempt offers ordinary Retry.
   The failed-attempt notice has padding, a tinted background and an error icon;
   its message and Retry remain readable on narrow screens in both themes. Verify
